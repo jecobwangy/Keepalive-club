@@ -13,7 +13,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 import requests
 from datetime import datetime
 import json
@@ -62,7 +62,18 @@ class LeaflowAutoCheckin:
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
         self.driver = webdriver.Chrome(options=chrome_options)
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # 避免长时间因为某些资源阻塞而卡住导航（这里设置为 30s，可按需调整）
+        try:
+            self.driver.set_page_load_timeout(30)
+            self.driver.set_script_timeout(30)
+        except Exception:
+            # 旧版本 selenium 可能不支持某些方法，忽略
+            pass
+        # 隐藏 webdriver 标志
+        try:
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        except Exception:
+            pass
         
     def close_popup(self):
         """关闭初始弹窗"""
@@ -350,56 +361,121 @@ class LeaflowAutoCheckin:
         return saved
 
     def restore_session_to_checkin(self, saved):
-        """在 checkin 子域上注入 cookies 与 localStorage 并刷新页面以生效"""
+        """在 checkin 子域上注入 cookies 与 localStorage 并刷新页面以生效
+
+        实现要点：
+        - 先以短超时尝试打开目标页面，避免无限等待。
+        - 尝试使用 Selenium.add_cookie 注入（需要页面域匹配）。
+        - 对失败或被阻塞的 cookie 使用 CDP(Network.setCookie) 回退，这通常更可靠且不易被页面加载阻塞。
+        """
         try:
             logger.info("🔁 准备在 checkin 子域注入已保存会话...")
-            # 先打开目标域（Selenium 要求 add_cookie 时域匹配当前页）
-            self.driver.get(self.CHECKIN_URL)
-            time.sleep(2)
+            # 尝试短超时导航，避免被网络资源阻塞过久
+            try:
+                # 尝试进入 checkin 页面，set_page_load_timeout 之前已设置，捕获超时不阻止后续注入
+                self.driver.get(self.CHECKIN_URL)
+            except Exception as e:
+                logger.warning(f"⚠️ 导航到 {self.CHECKIN_URL} 超时或失败（可忽略，只要能注入 cookie 即行）: {e}")
 
-            # 注入 cookies（过滤掉不被 add_cookie 支持的字段）
-            for c in saved.get("cookies", []):
+            cookies = saved.get("cookies", []) or []
+            logger.info(f"🔁 尝试注入 {len(cookies)} 个 cookie（优先使用 Selenium.add_cookie）")
+            added_count = 0
+            failed_cookies = []
+
+            for c in cookies:
+                # 过滤并构造可被 add_cookie 接受的对象
                 cookie = {}
-                for k in ("name", "value", "path", "domain", "secure", "httpOnly", "expiry"):
-                    if k in c:
-                        cookie[k] = c[k]
-                # 强制把 domain 调整为主域，常用形式 .leaflow.net（多数站点允许）
-                cookie_domain = cookie.get("domain", "")
+                if not c.get("name") or c.get("value") is None:
+                    continue
+                cookie["name"] = c["name"]
+                cookie["value"] = c["value"]
+                cookie["path"] = c.get("path", "/")
+                # 强制使用主域形式，便于子域接受
+                cookie["domain"] = ".leaflow.net"
+                if c.get("secure"):
+                    cookie["secure"] = bool(c.get("secure"))
+                if c.get("httpOnly"):
+                    cookie["httpOnly"] = bool(c.get("httpOnly"))
+                if "expiry" in c and c["expiry"] is not None:
+                    try:
+                        cookie["expiry"] = int(float(c["expiry"]))
+                    except Exception:
+                        # 忽略无法解析的 expiry
+                        pass
                 try:
-                    if cookie_domain:
-                        # 统一为 .leaflow.net，便于子域共享。若注入失败会被捕获并忽略
-                        cookie["domain"] = ".leaflow.net"
-                    else:
-                        cookie["domain"] = ".leaflow.net"
-                except:
-                    cookie["domain"] = ".leaflow.net"
-                try:
-                    # Selenium 要求当前页域与 cookie.domain 兼容（checkin.leaflow.net 与 .leaflow.net 兼容）
                     self.driver.add_cookie(cookie)
+                    added_count += 1
                 except Exception as e:
-                    logger.debug(f"⚠️ 添加 cookie {cookie.get('name')} 失败，已忽略: {e}")
+                    logger.debug(f"ℹ️ Selenium.add_cookie 无法添加 cookie {cookie.get('name')}: {e}")
+                    # 记录待回退的 cookie（用 CDP 设置）
+                    failed_cookies.append(c)
 
-            # 注入 localStorage（先清空再写入）
-            ls = saved.get("localStorage", {})
+            logger.info(f"🔁 Selenium.add_cookie 注入成功 {added_count} 个，需回退处理 {len(failed_cookies)} 个")
+
+            # 如果存在需要回退注入的 cookie，使用 CDP(Network.setCookie)
+            cdp_set_count = 0
+            if failed_cookies:
+                try:
+                    # 启用 Network（某些 chrome 版本要求先 enable）
+                    try:
+                        self.driver.execute_cdp_cmd("Network.enable", {})
+                    except Exception as e:
+                        logger.debug(f"ℹ️ CDP Network.enable 失败或不可用: {e}")
+
+                    for c in failed_cookies:
+                        name = c.get("name")
+                        value = c.get("value", "")
+                        payload = {
+                            "url": self.CHECKIN_URL,
+                            "name": name,
+                            "value": value,
+                            "path": c.get("path", "/"),
+                            "secure": bool(c.get("secure", False)),
+                            "httpOnly": bool(c.get("httpOnly", False)),
+                        }
+                        # expiry -> expires (CDP 用 expires)
+                        if "expiry" in c and c["expiry"] is not None:
+                            try:
+                                payload["expires"] = int(float(c["expiry"]))
+                            except Exception:
+                                pass
+                        # sameSite may be present but CDP may accept as string; ignore if problematic
+                        try:
+                            self.driver.execute_cdp_cmd("Network.setCookie", payload)
+                            cdp_set_count += 1
+                        except Exception as e:
+                            logger.debug(f"⚠️ CDP setCookie 失败 cookie={name}: {e}")
+                except Exception as e:
+                    logger.debug(f"ℹ️ 使用 CDP 回退注入 cookie 时发生错误: {e}")
+
+            logger.info(f"🔁 CDP 注入成功 {cdp_set_count} 个 (回退部分)")
+
+            # 注入 localStorage（仅在能执行脚本时）
+            ls = saved.get("localStorage", {}) or {}
             if ls:
                 try:
-                    # 通过一次 execute_script 批量写入，避免跨请求开销
+                    # 在 checkin 域下写入 localStorage（先清空再写）
                     set_script = "window.localStorage.clear();"
                     for k, v in ls.items():
-                        # 使用 json.dumps 来正确转义 key/value
                         set_script += f"window.localStorage.setItem({json.dumps(k)}, {json.dumps(v)});"
-                    self.driver.execute_script(set_script)
-                    logger.info(f"✅ 已注入 {len(ls)} 个 localStorage 项到 {self.CHECKIN_URL}")
+                    try:
+                        self.driver.execute_script(set_script)
+                        logger.info(f"✅ 已注入 {len(ls)} 个 localStorage 项到 {self.CHECKIN_URL}")
+                    except WebDriverException as e:
+                        # 如果当前页面还没加载/无法执行脚本，会抛出异常，记录并继续
+                        logger.debug(f"⚠️ 注入 localStorage 时无法执行脚本: {e}")
                 except Exception as e:
                     logger.debug(f"⚠️ 注入 localStorage 失败: {e}")
 
-            # 刷新让注入生效
+            # 刷新页面以让 cookie/localStorage 生效
             try:
                 self.driver.refresh()
-                time.sleep(2)
-            except Exception:
-                time.sleep(1)
-            logger.info("✅ 注入会话并刷新完成")
+                time.sleep(1.5)
+            except Exception as e:
+                logger.debug(f"ℹ️ 刷新页面时发生错误（可忽略）: {e}")
+
+            total_injected = added_count + cdp_set_count
+            logger.info(f"🔁 会话注入完成：成功注入 {total_injected}/{len(cookies)} 个 cookie")
             return True
         except Exception as e:
             logger.warning(f"⚠️ 恢复会话到 checkin 页面时出错: {e}")
@@ -571,7 +647,7 @@ class LeaflowAutoCheckin:
             except Exception as e:
                 logger.debug(f"⚠️ 注入会话时出错: {e}")
 
-            # 如果注入后仍然没登录或没找到签到元素，继续尝试查找按钮
+            # 如果注入后仍然没登录或没找到签���元素，继续尝试查找按钮
             if not self.wait_for_checkin_page_loaded():
                 raise Exception("❌ 签到页面加载失败，无法找到相关元素")
 
@@ -788,7 +864,7 @@ class MultiAccountManager:
     
     def run_all(self):
         """运行所有账号的签到流程"""
-        logger.info(f"👉 ���始执行 {len(self.accounts)} 个账号的签到任务")
+        logger.info(f"👉 开始执行 {len(self.accounts)} 个账号的签到任务")
         
         results = []
         
