@@ -16,6 +16,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException
 import requests
 from datetime import datetime
+import json
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -322,6 +323,88 @@ class LeaflowAutoCheckin:
         
         return False
 
+    def save_session(self):
+        """保存当前会话：cookies 与 localStorage（在当前域可读时）"""
+        saved = {"cookies": [], "localStorage": {}}
+        try:
+            saved["cookies"] = self.driver.get_cookies() or []
+            logger.info(f"👉 已保存 {len(saved['cookies'])} 个 cookie")
+        except Exception as e:
+            logger.warning(f"⚠️ 获取 cookies 失败: {e}")
+        
+        try:
+            # 读取当前页面的 localStorage（仅在当前域可访问时）
+            ls = self.driver.execute_script("""
+                var items = {};
+                for (var i = 0; i < localStorage.length; i++) {
+                    var k = localStorage.key(i);
+                    items[k] = localStorage.getItem(k);
+                }
+                return items;
+            """)
+            saved["localStorage"] = ls or {}
+            logger.info(f"👉 已保存 {len(saved['localStorage'])} 个 localStorage 项")
+        except Exception as e:
+            logger.debug(f"ℹ️ 无法读取 localStorage 或未设置: {e}")
+        
+        return saved
+
+    def restore_session_to_checkin(self, saved):
+        """在 checkin 子域上注入 cookies 与 localStorage 并刷新页面以生效"""
+        try:
+            logger.info("🔁 准备在 checkin 子域注入已保存会话...")
+            # 先打开目标域（Selenium 要求 add_cookie 时域匹配当前页）
+            self.driver.get(self.CHECKIN_URL)
+            time.sleep(2)
+
+            # 注入 cookies（过滤掉不被 add_cookie 支持的字段）
+            for c in saved.get("cookies", []):
+                cookie = {}
+                for k in ("name", "value", "path", "domain", "secure", "httpOnly", "expiry"):
+                    if k in c:
+                        cookie[k] = c[k]
+                # 强制把 domain 调整为主域，常用形式 .leaflow.net（多数站点允许）
+                cookie_domain = cookie.get("domain", "")
+                try:
+                    if cookie_domain:
+                        # 统一为 .leaflow.net，便于子域共享。若注入失败会被捕获并忽略
+                        cookie["domain"] = ".leaflow.net"
+                    else:
+                        cookie["domain"] = ".leaflow.net"
+                except:
+                    cookie["domain"] = ".leaflow.net"
+                try:
+                    # Selenium 要求当前页域与 cookie.domain 兼容（checkin.leaflow.net 与 .leaflow.net 兼容）
+                    self.driver.add_cookie(cookie)
+                except Exception as e:
+                    logger.debug(f"⚠️ 添加 cookie {cookie.get('name')} 失败，已忽略: {e}")
+
+            # 注入 localStorage（先清空再写入）
+            ls = saved.get("localStorage", {})
+            if ls:
+                try:
+                    # 通过一次 execute_script 批量写入，避免跨请求开销
+                    set_script = "window.localStorage.clear();"
+                    for k, v in ls.items():
+                        # 使用 json.dumps 来正确转义 key/value
+                        set_script += f"window.localStorage.setItem({json.dumps(k)}, {json.dumps(v)});"
+                    self.driver.execute_script(set_script)
+                    logger.info(f"✅ 已注入 {len(ls)} 个 localStorage 项到 {self.CHECKIN_URL}")
+                except Exception as e:
+                    logger.debug(f"⚠️ 注入 localStorage 失败: {e}")
+
+            # 刷新让注入生效
+            try:
+                self.driver.refresh()
+                time.sleep(2)
+            except Exception:
+                time.sleep(1)
+            logger.info("✅ 注入会话并刷新完成")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ 恢复会话到 checkin 页面时出错: {e}")
+            return False
+
     def open_workspaces_and_click_checkin_entry(self):
         """在 workspaces 页面查找并点击 '签到试用' 入口，点击后应会跳转到签到页面（或打开新地址）"""
         try:
@@ -426,38 +509,82 @@ class LeaflowAutoCheckin:
             return "ERROR"
               
     def checkin(self):
-        """执行签到流程"""
+        """执行签到流程（支持 workspaces 弹窗/iframe 与 直接访问 checkin 子域两种策略）"""
         logger.info("👉 开始签到流程（优先尝试 workspaces 页面入口）...")
-        # 先尝试从 workspaces 页面进入签到入口（'签到试用'）
+        saved_session = {"cookies": [], "localStorage": {}}
         try:
+            # 先保存当前会话（登录后在 dashboard/主域上保存）
+            try:
+                saved_session = self.save_session()
+            except Exception as e:
+                logger.debug(f"ℹ️ 保存会话时出错: {e}")
+
+            # 优先尝试在 workspaces 页面点击 '签到试用' 入口
             entered = self.open_workspaces_and_click_checkin_entry()
             if entered:
-                # 等待可能的跳转到 checkin 页面
+                # 点击入口后，页面可能打开弹窗/iframe 或在当前窗口跳转
+                time.sleep(2)
+                # 检查页面中是否存在指向 checkin 的 iframe
                 try:
-                    WebDriverWait(self.driver, 10).until(lambda d: "checkin" in d.current_url or "checkin.leaflow.net" in d.current_url or "checkin" in d.page_source)
-                    logger.info(f"👉 已跳转到签到页面，当前URL: {self.driver.current_url}")
-                except Exception:
-                    # 不强制报错，继续后续检查（因为可能打开弹窗或iframe）
-                    logger.info("ℹ️ 点击入口后未检测到 URL 立即变化，稍后继续查找签到元素")
-            else:
-                logger.info("ℹ️ 未通过 workspaces 找到入口，尝试直接访问签到地址")
-                self.driver.get(self.CHECKIN_URL)
+                    iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+                    for iframe in iframes:
+                        try:
+                            src = iframe.get_attribute("src") or ""
+                            if "checkin" in src:
+                                logger.info("👉 在 workspaces 页面检测到指向 checkin 子域的 iframe，切换到 iframe 内执行签到")
+                                self.driver.switch_to.frame(iframe)
+                                # 在 iframe 内等待并点击签到
+                                if not self.wait_for_checkin_page_loaded():
+                                    # iframe 内没找到签到元素，切回主文档继续后续逻辑
+                                    logger.info("ℹ️ iframe 内未找到签到元素，切回主文档")
+                                    self.driver.switch_to.default_content()
+                                    break
+                                click_result = self.find_and_click_checkin_button()
+                                if click_result == "ALREADY_CHECKED_IN":
+                                    # 切回默认文档
+                                    self.driver.switch_to.default_content()
+                                    return "今日已签到"
+                                if click_result != "CLICK_SUCCESS":
+                                    logger.warning("⚠️ 在 iframe 内尝试点击签到失败，切回主文档并尝试直接打开 checkin 页面")
+                                    self.driver.switch_to.default_content()
+                                    break
+                                # 获取结果（在 iframe 内）
+                                result_message = self.get_checkin_result()
+                                # 切回默认文档
+                                self.driver.switch_to.default_content()
+                                return result_message
+                        except Exception:
+                            # 若某个 iframe 操作失败，继续检查其它 iframe
+                            try:
+                                self.driver.switch_to.default_content()
+                            except:
+                                pass
+                            continue
+                except Exception as e:
+                    logger.debug(f"ℹ️ 检查 iframe 时出错: {e}")
 
-            # 等待签到页面加载（最多重试设置的次数）
+            # 如果未通过 workspaces（或 iframe）成功，则直接访问 checkin 子域并注入会话
+            logger.info("ℹ️ 将尝试直接访问 checkin 子域并注入会话")
+            injected = False
+            try:
+                injected = self.restore_session_to_checkin(saved_session)
+            except Exception as e:
+                logger.debug(f"⚠️ 注入会话时出错: {e}")
+
+            # 如果注入后仍然没登录或没找到签到元素，继续尝试查找按钮
             if not self.wait_for_checkin_page_loaded():
                 raise Exception("❌ 签到页面加载失败，无法找到相关元素")
-            
-            # 查找并点击立即签到按钮
+
+            # 在 checkin 页面查找并点击立即签到按钮
             click_result = self.find_and_click_checkin_button()
-            
             if click_result == "ALREADY_CHECKED_IN":
                 return "今日已签到"
             if click_result != "CLICK_SUCCESS":
                 raise Exception("⚠️ 找不到立即签到按钮或按钮不可点击")
-            
+
             logger.info("👉 已点击立即签到按钮")
             time.sleep(self.WAIT_TIME_AFTER_CHECKIN_CLICK)
-            
+
             # 获取签到结果
             result_message = self.get_checkin_result()
             return result_message
@@ -506,7 +633,7 @@ class LeaflowAutoCheckin:
                         if keyword in line and len(line.strip()) < 100:  # 避免提取过长的文本
                             return line.strip()
             
-            return "⚠️ 签到完成，但未找到具���结果消息"
+            return "⚠️ 签到完成，但未找到具体结果消息"
             
         except Exception as e:
             return f"❌ 获取签到结果时出错: {str(e)}"
@@ -557,7 +684,7 @@ class MultiAccountManager:
                 account_pairs = [
                     pair.strip() for pair in accounts_str.replace('\r', '').replace(',', '\n').split('\n') if pair.strip()
                 ]
-                logger.info(f"👉 共找到 {len(account_pairs)} ���账号")
+                logger.info(f"👉 共找到 {len(account_pairs)} 个账号")
                 
                 for i, pair in enumerate(account_pairs):
                     if ':' in pair:
@@ -661,7 +788,7 @@ class MultiAccountManager:
     
     def run_all(self):
         """运行所有账号的签到流程"""
-        logger.info(f"👉 开始执行 {len(self.accounts)} 个账号的签到任务")
+        logger.info(f"👉 ���始执行 {len(self.accounts)} 个账号的签到任务")
         
         results = []
         
