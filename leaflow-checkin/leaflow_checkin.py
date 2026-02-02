@@ -293,8 +293,10 @@ class LeaflowAutoCheckin:
                 checkin_indicators = [
                     "button.checkin-btn",  # 优先使用这个选择器
                     "//button[contains(text(), '立即签到')]",
+                    "//button[contains(text(), '已完成')]",
                     "//*[contains(text(), '每日签到')]",
-                    "//*[contains(text(), '签到')]"
+                    "//*[contains(text(), '签到')]",
+                    "//*[contains(text(), '今日已签到')]"
                 ]
                 
                 for indicator in checkin_indicators:
@@ -330,8 +332,8 @@ class LeaflowAutoCheckin:
             checkin_btn = self.wait_for_element_present(By.CSS_SELECTOR, "button.checkin-btn", 10)
 
             # 判断是否已经签到
-            if not checkin_btn.is_enabled() and ("已签到" in checkin_btn.text or "disabled" in checkin_btn.get_attribute("class")):
-                logger.info("👉 签到按钮显示为 '已签到' 且不可点击。")
+            if not checkin_btn.is_enabled() and ("已签到" in checkin_btn.text or "已完成" in checkin_btn.text or "disabled" in checkin_btn.get_attribute("class")):
+                logger.info("👉 签到按钮显示为 '已完成' 且不可点击。")
                 return "ALREADY_CHECKED_IN" # 返回已签到标记
 
             # 尝试点击签到按钮
@@ -405,6 +407,7 @@ class LeaflowAutoCheckin:
                 "button.checkin-btn",
                 "//button[contains(text(), '立即签到')]",
                 "//button[contains(text(), '签到')]",
+                "//button[contains(text(), '已完成')]",
                 ".modal-content button",
                 ".popup button"
             ]
@@ -428,8 +431,8 @@ class LeaflowAutoCheckin:
                 return "NO_POPUP_BUTTON"
             
             # 检查是否已经签到
-            if not popup_checkin_button.is_enabled() and ("已签到" in popup_checkin_button.text or "disabled" in popup_checkin_button.get_attribute("class")):
-                logger.info("👉 弹出窗口中显示为'已签到'且不可点击")
+            if not popup_checkin_button.is_enabled() and ("已签到" in popup_checkin_button.text or "已完成" in popup_checkin_button.text or "disabled" in popup_checkin_button.get_attribute("class")):
+                logger.info("👉 弹出窗口中显示为'已完成'且不可点击")
                 return "今日已签到"
             
             # 点击弹出窗口中的签到按钮
@@ -461,6 +464,16 @@ class LeaflowAutoCheckin:
             if not self.wait_for_checkin_page_loaded():
                 logger.warning("⚠️ 策略1：签到页面加载失败")
             else:
+                # 先检查页面是否显示"今日已签到"
+                try:
+                    time.sleep(3)
+                    page_text = self.driver.find_element(By.TAG_NAME, "body").text
+                    if "今日已签到" in page_text:
+                        logger.info("✅ 策略1：页面显示'今日已签到'")
+                        return "今日已签到"
+                except:
+                    pass
+                
                 # 查找并点击立即签到按钮
                 click_result = self.find_and_click_checkin_button()
                 
@@ -487,8 +500,26 @@ class LeaflowAutoCheckin:
         
         # 如果策略2也失败，返回失败信息
         if result in ["NO_TRIAL_BUTTON", "NO_POPUP_BUTTON"]:
+            # 再次检查当前页面是否显示"今日已签到"
+            try:
+                time.sleep(3)
+                page_text = self.driver.find_element(By.TAG_NAME, "body").text
+                if "今日已签到" in page_text:
+                    logger.info("✅ 页面显示'今日已签到'")
+                    return "今日已签到"
+            except:
+                pass
             raise Exception(f"❌ 两种签到策略都失败: {result}")
         if "失败" in result and "策略2" in result:
+            # 再次检查当前页面是否显示"今日已签到"
+            try:
+                time.sleep(3)
+                page_text = self.driver.find_element(By.TAG_NAME, "body").text
+                if "今日已签到" in page_text:
+                    logger.info("✅ 页面显示'今日已签到'")
+                    return "今日已签到"
+            except:
+                pass
             raise Exception(result)
         
         return result
